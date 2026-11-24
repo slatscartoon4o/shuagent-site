@@ -147,6 +147,17 @@ export function wordsOf(text) {
 
 const KEYS = ['title', 'date', 'tags', 'draft', 'layout', 'slug', 'summary'];
 
+/** Whether a code unit is a letter (a URL's first character: [A-Za-z]). */
+const A2Z = new Uint8Array(128);
+for (let c = 65; c <= 90; c++) A2Z[c] = 1;
+for (let c = 97; c <= 122; c++) A2Z[c] = 1;
+/** Whether a code unit may follow the first of a URL's scheme: [A-Za-z0-9+.-]. */
+const SCHEME = new Uint8Array(128);
+for (let c = 65; c <= 90; c++) SCHEME[c] = 1;
+for (let c = 97; c <= 122; c++) SCHEME[c] = 1;
+for (let c = 48; c <= 57; c++) SCHEME[c] = 1;
+for (const ch of '+.-') SCHEME[ch.charCodeAt(0)] = 1;
+
 /** The days of month `m` (1-12) of year `y`, by the Gregorian rule. */
 function daysIn(y, m) {
   if (m === 2) return (y % 4 === 0 && y % 100 !== 0) || y % 400 === 0 ? 29 : 28;
@@ -1059,41 +1070,50 @@ function analyzeFree(nodes, bound, acc) {
   }
 }
 
-/** Whether `nodes` hold an include anywhere (through for and if). */
+/** Whether `nodes` hold an include anywhere (through for and if). Memoised: the answer depends on `nodes` alone. */
+const INC_CACHE = new WeakMap();
 function hasInclude(nodes) {
+  let v = INC_CACHE.get(nodes);
+  if (v !== undefined) return v;
   for (const node of nodes) {
-    if (node.kind === 'include') return true;
+    if (node.kind === 'include') { INC_CACHE.set(nodes, true); return true; }
     if (node.kind === 'for') {
-      if (hasInclude(node.body)) return true;
+      if (hasInclude(node.body)) { INC_CACHE.set(nodes, true); return true; }
     } else if (node.kind === 'if') {
-      if (hasInclude(node.then)) return true;
-      if (node.else !== null && hasInclude(node.else)) return true;
+      if (hasInclude(node.then) || (node.else !== null && hasInclude(node.else))) { INC_CACHE.set(nodes, true); return true; }
     }
   }
+  INC_CACHE.set(nodes, false);
   return false;
 }
 
-/** Whether `nodes` read `loop` outside a for of their own (which would bind its own). */
+/** Whether `nodes` read `loop` outside a for of their own (which would bind its own). Memoised like hasInclude. */
+const LOOP_CACHE = new WeakMap();
 function usesLoop(nodes) {
+  let v = LOOP_CACHE.get(nodes);
+  if (v !== undefined) return v;
+  let hit = false;
   for (const node of nodes) {
     switch (node.kind) {
       case 'var':
       case 'raw':
-        if (node.path[0] === 'loop') return true;
+        if (node.path[0] === 'loop') hit = true;
         break;
       case 'if':
-        if (node.path[0] === 'loop') return true;
-        if (usesLoop(node.then)) return true;
-        if (node.else !== null && usesLoop(node.else)) return true;
+        if (node.path[0] === 'loop') hit = true;
+        else if (usesLoop(node.then)) hit = true;
+        else if (node.else !== null && usesLoop(node.else)) hit = true;
         break;
       case 'for':
-        if (node.path[0] === 'loop') return true;
+        if (node.path[0] === 'loop') hit = true;
         break;
       default:
         break;
     }
+    if (hit) break;
   }
-  return false;
+  LOOP_CACHE.set(nodes, hit);
+  return hit;
 }
 
 /** A path as a JavaScript expression over the locals and the scope chain. */
@@ -1172,20 +1192,26 @@ function compileTemplates(ordered, fixed) {
   const H = helpers();
   // a stand-in function for every template index, so a render before the real ones exist sees an empty include
   while (H.T.length < ordered.length) H.T.push(() => '');
-  // pass 1: no inlining, so a template can be rendered to find its fixed text
-  const pass1 = ordered.map(([, nodes]) => compileOne(nodes, EMPTY_HOIST));
-  for (let i = 0; i < pass1.length; i++) H.T[i] = pass1[i];
   const fixedVars = { site: fixed.site, tags: fixed.tags, recent: fixed.recent };
   const fixedScope = { vars: fixedVars, parent: null };
-  const staticText = new Map();
+  // Only the templates that are fixed text are compiled here: a fixed template includes fixed templates alone, so
+  // every include one makes is itself fixed text and is compiled in this same pass.
+  const pass1 = new Array(ordered.length);
+  const fixedIdx = [];
   for (let i = 0; i < ordered.length; i++) {
-    const name = ordered[i][0];
-    if (!isFixedText(name)) continue;
+    if (!isFixedText(ordered[i][0])) continue;
+    pass1[i] = compileOne(ordered[i][1], EMPTY_HOIST);
+    H.T[i] = pass1[i];
+    fixedIdx.push(i);
+  }
+  // its text at every include depth: a fixed template that agrees at all depths is the same in every page
+  const staticText = new Map();
+  for (const i of fixedIdx) {
     const texts = [];
     for (let d = 0; d < INCLUDE_DEPTH; d++) texts.push(pass1[i](fixedScope, d));
     let same = true;
     for (let d = 1; d < texts.length; d++) if (texts[d] !== texts[0]) { same = false; break; }
-    if (same) staticText.set(name, texts[0]);
+    if (same) staticText.set(ordered[i][0], texts[0]);
   }
   // pass 2: the templates that are not fixed text inline those that are, and fold the if/for subtrees only fixed
   // values decide
@@ -1385,7 +1411,18 @@ export function build(input) {
     const link = (target) => {
       const c0 = target.charCodeAt(0);
       if (c0 === 47 || c0 === 35) return target;
-      if (/^[A-Za-z][A-Za-z0-9+.-]*:/.test(target)) return target;
+      // an absolute URL opens on a letter, after which scheme characters and then a ":" come: scan it rather than
+      // run a regex on every link (most are relative, and fail on their first character)
+      if (A2Z[c0]) {
+        let i = 1;
+        const n = target.length;
+        while (i < n) {
+          const c = target.charCodeAt(i);
+          if (!SCHEME[c < 128 ? c : 0]) break;
+          i++;
+        }
+        if (i > 0 && i < n && target.charCodeAt(i) === 58) return target;
+      }
       const hash = target.indexOf('#');
       const rel = hash === -1 ? target : target.slice(0, hash);
       const frag = hash === -1 ? '' : target.slice(hash);
