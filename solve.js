@@ -386,6 +386,24 @@ function trimSt(s) {
   return a === 0 && b === s.length ? s : s.slice(a, b);
 }
 
+/** `src` from `start` to `end` with spaces and tabs dropped at both ends: one slice, and none at all when the range
+ * is already trimmed (the line is not copied out of `src` first, so a trimmed line costs only its own string). */
+function trimRange(src, start, end) {
+  let a = start;
+  let b = end;
+  while (a < b) {
+    const c = src.charCodeAt(a);
+    if (c === 32 || c === 9) a++;
+    else break;
+  }
+  while (b > a) {
+    const c = src.charCodeAt(b - 1);
+    if (c === 32 || c === 9) b--;
+    else break;
+  }
+  return src.slice(a, b);
+}
+
 /** A heading line's depth and text, or null (a heading's text is never empty). */
 function headingOf(line) {
   const n = line.length;
@@ -690,7 +708,15 @@ export function inline(s, link) {
   return last === 0 ? escapeHtml(s) : last >= n ? out : out + s.slice(last);
 }
 
-/** Whether `line` could be a block that is more than a paragraph: its first character (or its being empty). */
+/** Whether `src` from `start` to `end` is blank: spaces and tabs only. */
+function isBlankRange(src, start, end) {
+  for (let i = start; i < end; i++) {
+    const c = src.charCodeAt(i);
+    if (c !== 32 && c !== 9) return false;
+  }
+  return true;
+}
+
 /**
  * `src` rendered: its HTML (each block on its own lines, a "\n" after the last), its table of contents (every level 2
  * and 3 heading: level, id and its inline HTML) and its excerpt (the first paragraph's inline HTML, or "").
@@ -783,6 +809,17 @@ export function renderMarkdown(src, link) {
     while (pos <= n) {
       let e2 = src.indexOf('\n', pos);
       if (e2 === -1) e2 = n;
+      // a paragraph is ended by a blank line and by a fence, a heading or a break, and those three open on one of
+      // four characters: a line that opens on none of them and is not blank joins the paragraph without ever being
+      // copied out of `src` to be looked at
+      if (e2 > pos) {
+        const c = src.charCodeAt(pos);
+        if (c !== 35 && c !== 96 && c !== 45 && c !== 42 && !isBlankRange(src, pos, e2)) {
+          body.push(trimRange(src, pos, e2));
+          pos = e2 + 1;
+          continue;
+        }
+      }
       const l = src.slice(pos, e2);
       // a line that cannot open a block is a paragraph line: only a blank, fence, heading or break ends one
       if (endsParagraph(l)) break;
@@ -993,9 +1030,12 @@ function compileBody(nodes, ctx, depth, scope) {
         break;
       }
       case 'include': {
-        const cached = ctx.hoist.get(node.name);
+        // a fixed template's text is the same in every page only where no for of the caller binds a name it reads:
+        // inside one, the loop's binding can shadow a fixed name, so the include is rendered as it is. Past the last
+        // include depth an include renders nothing, as H.T does, so the literal is guarded the same way.
+        const cached = ctx.locals.length === 0 ? ctx.hoist.get(node.name) : undefined;
         if (cached !== undefined) {
-          code += `out+=${JSON.stringify(cached)};`;
+          code += `if(d<8)out+=${JSON.stringify(cached)};`;
           break;
         }
         const idx = ctx.index.get(node.name);
@@ -1192,7 +1232,10 @@ function compileTemplates(ordered, fixed) {
   const H = helpers();
   // a stand-in function for every template index, so a render before the real ones exist sees an empty include
   while (H.T.length < ordered.length) H.T.push(() => '');
-  const fixedVars = { site: fixed.site, tags: fixed.tags, recent: fixed.recent };
+  const fixedVars = Object.create(null);
+  fixedVars.site = fixed.site;
+  fixedVars.tags = fixed.tags;
+  fixedVars.recent = fixed.recent;
   const fixedScope = { vars: fixedVars, parent: null };
   // Only the templates that are fixed text are compiled here: a fixed template includes fixed templates alone, so
   // every include one makes is itself fixed text and is compiled in this same pass.
@@ -1204,11 +1247,12 @@ function compileTemplates(ordered, fixed) {
     H.T[i] = pass1[i];
     fixedIdx.push(i);
   }
-  // its text at every include depth: a fixed template that agrees at all depths is the same in every page
+  // its text at every include depth the render can see: INCLUDE_DEPTH itself renders nothing, so the probes cover
+  // 0 through INCLUDE_DEPTH and a template whose text agrees at all of them is the same text wherever it is included
   const staticText = new Map();
   for (const i of fixedIdx) {
     const texts = [];
-    for (let d = 0; d < INCLUDE_DEPTH; d++) texts.push(pass1[i](fixedScope, d));
+    for (let d = 0; d <= INCLUDE_DEPTH; d++) texts.push(pass1[i](fixedScope, d));
     let same = true;
     for (let d = 1; d < texts.length; d++) if (texts[d] !== texts[0]) { same = false; break; }
     if (same) staticText.set(ordered[i][0], texts[0]);
@@ -1237,9 +1281,15 @@ const EMPTY_FREE = { names: new Set(), includes: new Set() };
 const EMPTY_BOUND = new Set();
 const EMPTY_HOIST = new Map();
 
-/** A path's value in a fixed scope (a plain object, or one whose prototype holds an outer for's bindings). */
+/**
+ * A path's value in a fixed scope: a prototype chain of frames, each holding only its own bindings. The first name is
+ * read from the nearest frame that holds it as an own property (never from Object.prototype), and the rest as own
+ * properties down the value, as makefun-site's lookup does.
+ */
 function lookIn(path, vars) {
-  let v = path[0] in vars ? vars[path[0]] : undefined;
+  let frame = vars;
+  while (frame != null && !Object.hasOwn(frame, path[0])) frame = Object.getPrototypeOf(frame);
+  let v = frame == null ? undefined : frame[path[0]];
   for (let i = 1; i < path.length; i++) {
     if (v === null || typeof v !== 'object' || !Object.hasOwn(v, path[i])) return undefined;
     v = v[path[i]];
